@@ -4,3 +4,7 @@
 # Environment / secrets
 .env
 .env.local
+.venv/
+
+# Preview app
+/week0_explore/preview/
