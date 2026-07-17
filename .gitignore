@@ -6,5 +6,11 @@
 .env.local
 .venv/
 
+# Claude Code backend files
+.claude/
+.claude/**
+.claude.local.json
+.claudeignore 
+
 # Preview app
 /week0_explore/preview/
