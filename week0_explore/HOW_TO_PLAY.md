@@ -7,7 +7,7 @@ cd week0_explore/infrastructure
 docker compose up --build
 ```
 
-Some other helpful docker commands for us the know.
+Some other helpful docker commands to know.
 ```sh
 docker compose up --build -d # run in the background
 docker compose logs -f # delete the logs
@@ -29,10 +29,10 @@ nc localhost 4000
 
 ## Create Admin Character
 
-The first character you create will because your admin character.
-Think of it as your AWS root account. You aren't suppose to play the game as this characeter.
+The first character you create will be your admin character.
+Think of it as your AWS root account. You aren't supposed to play the game as this character.
 
-They admin character will have the following attributes:
+The admin character will have the following attributes:
 - Level 34
 - Known as the Implentor
 - Top Admistrator Role
@@ -43,7 +43,7 @@ After creating your admin character:
 
 Confirm you're admin with `score`:
 
-```txt
+```text
 > score
 You are 17 years old.
   It's your birthday today.
@@ -59,14 +59,14 @@ Confirm you can see the Admin's commands with: `wizhelp`.
 
 Try a couple of non-destructive admin commands: `where` and `users`:
 
-```txt
+```text
 > where
 Players
 -------
 Admin - [1204] The Immortal Board Room
 ```
 
-```txt
+```text
 > users
 Num Class   Name         State          Idl Login@   Site
 --- ------- ------------ -------------- --- -------- ------------------------
@@ -103,7 +103,7 @@ help consider
 help quests
 help inventory
 help equipment
-help experience # learn how experience worksskill
+help experience # learn about experience
 help ac # learn about armour class
 help warrior # learn about your class
 help practice # learn about practicing a skill or spell
@@ -115,8 +115,8 @@ help spells # learn about spells
 > I would get a pencil and paper and map out where you are.
 
 - The Temple of Midgaard - check the balance of your bank account
-- THe Reading Room - leave a message on the large bulletion board
-- By The Template of Altar - examine alter
+- The Reading Room - leave a message on the large bulletin board
+- By The Temple of Altar - examine altar
 - Temple Square - drink from the temple square
 - Find your guild:
   - Clerics Guild: West of Temple Square
@@ -127,7 +127,7 @@ help spells # learn about spells
 - look for weak enemines to defeat eg. `consider` to determine their strength
   - look around the midgaard without leaving town.
   - gather the corpse `get all corpse`
-- check your hitpoints (HP) with score and heal up by `rest` or `sleep` your hitpoints, perioidlly check until are fully healed.
+- check your hitpoints (HP) with score and heal up by `rest` or `sleep`, periodically check until fully healed.
 
 ### What if I get lost?
 
