@@ -7,10 +7,13 @@
 .venv/
 
 # Claude Code backend files
-.claude/
 .claude/**
 .claude.local.json
-.claudeignore 
+.claudeignore
+
+# BUT allow .claude/skills directories (useful for repo users)
+!.claude/skills/
+!.claude/skills/** 
 
 # Preview app
 /week0_explore/preview/
