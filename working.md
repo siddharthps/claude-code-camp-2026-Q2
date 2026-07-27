@@ -3386,3 +3386,1236 @@ Step 12: Context management & token limits
 ```
 
 ---
+
+# Step 7: The run DSL - Python Implementation Deep Dive
+
+## Overview
+
+Step 7 introduces the **`run()` function**, which solves the **usability problem**: "How do we let users get started with just one line of code, hiding all the machinery from Steps 0-6?"
+
+The run DSL (Domain-Specific Language) is a high-level API that abstracts away:
+- Config loading (Step 0)
+- Context, Registry, Backend setup (Steps 1-3)
+- Client and Logger (Steps 4, 6)
+- Agent loop (Step 5)
+
+**One function call, fully configured agent that runs to completion.**
+
+---
+
+## The RunDSL Class
+
+**File:** `boukensha/run_dsl.py` (11 lines)
+
+```python
+class RunDSL:
+    """The deliberately small tool-registration surface used by ``run``."""
+
+    def __init__(self, registry):
+        self._registry = registry
+
+    def tool(self, name, description, parameters=None):
+        return self._registry.tool(
+            name, description=description, parameters=parameters
+        )
+```
+
+### Purpose
+
+RunDSL is a **facade** over Registry that exposes only one method: `tool()`.
+
+**Why?** Users don't need to know about Registry. They just need to register tools. RunDSL keeps the surface small and focused.
+
+**Usage:**
+```python
+def register_tools(dsl):
+    @dsl.tool("read_file", description="...", parameters={...})
+    def read_file(path):
+        return Path(path).read_text()
+```
+
+That's it. No imports of Registry, no Context, no manual setup.
+
+---
+
+## The run() Function
+
+**File:** `boukensha/__init__.py` (lines 53-134)
+
+```python
+def run(
+    *, task, configure=None, system=None, model=None, backend=None, api_key=None,
+    ollama_host="http://localhost:11434", log=None, max_output_tokens=None,
+):
+    """Construct and run the configured player agent."""
+```
+
+### Parameters (All Keyword-Only)
+
+- `task` (**required**) — The user's goal as a string. E.g., "Read README.md and summarize it"
+- `configure` (optional) — Callable that takes RunDSL to register tools. Defaults to None (no tools)
+- `system` (optional) — System prompt. Defaults to Player task prompt from config
+- `model` (optional) — Model name. Defaults from config (e.g., "claude-haiku-4-5")
+- `backend` (optional) — Provider name. Defaults from config (e.g., "anthropic", "openai")
+- `api_key` (optional) — API key. Auto-loaded from environment variables if not provided
+- `ollama_host` (optional) — Ollama server URL. Defaults to "http://localhost:11434"
+- `log` (optional) — Custom log file path. Defaults to `.boukensha/sessions/<session-id>.jsonl`
+- `max_output_tokens` (optional) — Token limit per response. Defaults from config
+
+### The Implementation (Step by Step)
+
+**1. Load configuration:**
+```python
+cfg = config()
+task_settings = cfg.tasks(Player.task_name())
+```
+
+**2. Resolve system prompt:**
+```python
+if system is None:
+    system = Player.system_prompt(
+        task_settings,
+        user_prompts_dir=cfg.user_prompts_dir,
+        default_prompts_dir=Config.PROMPTS_DIR,
+    )
+```
+
+**3. Resolve model and backend:**
+```python
+if model is None:
+    model = Player.model(task_settings)
+if backend is None:
+    backend = Player.provider(task_settings)
+```
+
+**4. Resolve API key from environment:**
+```python
+if api_key is None:
+    import os
+    environment_variable = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "ollama_cloud": "OLLAMA_API_KEY",
+    }.get(backend)
+    if environment_variable is not None:
+        api_key = os.environ.get(environment_variable)
+```
+
+**5. Create Context and Registry:**
+```python
+context = Context(task=Player, system=system)
+registry = Registry(context)
+```
+
+**6. Call configure function (if provided):**
+```python
+if configure is not None:
+    configure(RunDSL(registry))
+```
+
+The `configure` callback gets a RunDSL instance and registers tools via decorators.
+
+**7. Create backend instance:**
+```python
+backend_classes = {
+    "anthropic": backends.Anthropic,
+    "openai": backends.OpenAI,
+    "gemini": backends.Gemini,
+    "ollama": backends.Ollama,
+    "ollama_cloud": backends.OllamaCloud,
+}
+backend_class = backend_classes.get(backend)
+if backend_class is None:
+    supported = "anthropic, openai, gemini, ollama, and ollama_cloud"
+    raise ValueError(f"Unknown backend {backend!r}. Use {supported}.")
+
+if backend == "ollama":
+    selected_backend = backend_class(model=model, host=ollama_host)
+else:
+    selected_backend = backend_class(api_key=api_key, model=model)
+```
+
+**8. Create PromptBuilder and Client:**
+```python
+builder = PromptBuilder(context, selected_backend)
+client = Client(builder)
+```
+
+**9. Resolve effective iteration and token limits:**
+```python
+effective_max_iterations = Player.max_iterations(task_settings)
+effective_max_output_tokens = (
+    Player.max_output_tokens(task_settings)
+    if max_output_tokens is None else max_output_tokens
+)
+```
+
+**10. Create Logger with snapshot:**
+```python
+logger = Logger(log=log, snapshot={
+    "task": Player.task_name(),
+    "max_iterations": effective_max_iterations,
+    "max_output_tokens": effective_max_output_tokens,
+    "model": model,
+    "provider": backend,
+})
+```
+
+**11. Create and run Agent (with try/finally):**
+```python
+try:
+    agent = Agent(
+        context=context,
+        registry=registry,
+        builder=builder,
+        client=client,
+        logger=logger,
+        task_settings=task_settings,
+        max_iterations=effective_max_iterations,
+        max_output_tokens=effective_max_output_tokens,
+    )
+    context.add_message("user", task)
+    return agent.run()
+finally:
+    logger.close()
+```
+
+**Why try/finally?** Ensures the logger file is closed even if an exception occurs.
+
+---
+
+## Global Configuration Helpers
+
+**File:** `boukensha/__init__.py` (lines 3-36)
+
+```python
+_config = None
+_quiet = False
+_debug = False
+
+def config():
+    """Return the process-wide, lazily constructed configuration."""
+    global _config
+    if _config is None:
+        _config = Config()
+    return _config
+
+def quiet():
+    global _quiet
+    _quiet = True
+
+def loud():
+    global _quiet
+    _quiet = False
+
+def is_quiet():
+    return _quiet
+
+def debug():
+    global _debug
+    _debug = True
+
+def is_debug():
+    return _debug
+```
+
+### Purpose
+
+These are **module-level globals** for controlling framework behavior:
+
+**`config()`** — Lazy singleton pattern. Config is loaded once and reused.
+
+**`quiet()` / `loud()`** — Control logging verbosity. Used by Agent and Logger.
+
+**`debug()` / `is_debug()`** — Enable debug mode. Logger includes full raw API responses when enabled.
+
+### Usage
+
+```python
+from boukensha import debug, run
+
+debug()  # Enable debug mode
+result = run(task="Read README.md", configure=register_tools)
+# Log file will now include raw API responses
+```
+
+---
+
+## Complete Example
+
+```python
+from boukensha import run
+
+def register_tools(dsl):
+    @dsl.tool(
+        "read_file",
+        description="Read the contents of a file from disk",
+        parameters={"path": {"type": "string", "description": "The file path to read"}},
+    )
+    def read_file(path):
+        return Path(path).read_text()
+
+    @dsl.tool(
+        "list_directory",
+        description="List the files in a directory",
+        parameters={"path": {"type": "string", "description": "The directory path to list"}},
+    )
+    def list_directory(path):
+        return ", ".join(sorted(f.name for f in Path(path).iterdir() if not f.name.startswith(".")))
+
+# One line to run the agent!
+result = run(
+    task="Read the README.md file and summarise what this framework can do.",
+    configure=register_tools,
+)
+
+print(result)
+```
+
+**What happens:**
+1. Config loads from `~/.boukensha/settings.yaml`
+2. System prompt loaded (or use default)
+3. Model and provider resolved from config
+4. API key fetched from environment
+5. Tools registered via `register_tools()`
+6. Agent created and run
+7. Logger writes to `.boukensha/sessions/<session-id>.jsonl`
+8. Result returned and printed
+
+**All with one `run()` call.**
+
+---
+
+## Overriding Defaults
+
+Every parameter can be overridden:
+
+```python
+result = run(
+    task="Read README.md",
+    configure=register_tools,
+    system="You are a pirate. Read the file and respond in pirate speak.",
+    model="claude-opus-4-8",  # More capable model
+    backend="openai",         # Use GPT instead of Claude
+    api_key="sk-...",         # Custom API key
+    max_output_tokens=2048,   # Larger response
+    log="/tmp/my-session.jsonl",  # Custom log file
+)
+```
+
+Each override bypasses the config file.
+
+---
+
+## Exported API
+
+**File:** `boukensha/__init__.py` (lines 136-160)
+
+```python
+__all__ = [
+    "ApiError",
+    "Agent",
+    "Client",
+    "Config",
+    "Context",
+    "Logger",
+    "LoopError",
+    "Message",
+    "Player",
+    "PromptBuilder",
+    "Registry",
+    "RunDSL",
+    "Tool",
+    "UnknownToolError",
+    "UnsupportedModelError",
+    "backends",
+    "config",
+    "debug",
+    "is_debug",
+    "is_quiet",
+    "loud",
+    "quiet",
+    "run",
+]
+```
+
+**For users:** Most will just use:
+```python
+from boukensha import run
+result = run(task="...", configure=my_tools)
+```
+
+**For advanced users:** Can import individual classes:
+```python
+from boukensha import Agent, Context, Registry, Client, PromptBuilder
+# Build custom orchestration
+```
+
+---
+
+## Error Handling
+
+```python
+try:
+    agent = Agent(...)
+    context.add_message("user", task)
+    return agent.run()
+finally:
+    logger.close()
+```
+
+Exceptions from the agent loop bubble up, but the logger is always closed:
+- ApiError from Client
+- UnknownToolError from Registry
+- Any exception from tool functions
+
+**Users should catch these:**
+```python
+from boukensha import run, ApiError, UnknownToolError
+
+try:
+    result = run(task="...", configure=my_tools)
+except ApiError as e:
+    print(f"API failed: {e}")
+except UnknownToolError as e:
+    print(f"Tool not found: {e}")
+except Exception as e:
+    print(f"Unexpected error: {e}")
+```
+
+---
+
+## Running the Example
+
+```bash
+cd week1_baseline/python/07_the_run_dsl
+python examples/example.py
+```
+
+**Expected output:**
+```
+=== BOUKENSHA Step 7: The run DSL ===
+
+Config: #<Boukensha::Config dir=~/.boukensha tasks=1>
+
+=== FINAL RESPONSE ===
+Boukensha is a progressive tutorial for building AI agents. It teaches:
+- Configuration management (Step 0)
+- Core data structures (Step 1)
+- Tool dispatching (Step 2)
+- Multi-provider LLM support (Step 3)
+...
+```
+
+---
+
+## What Just Happened (Simplified Flow)
+
+```
+User writes:
+  result = run(task="...", configure=register_tools)
+
+run() does:
+  1. Load config
+  2. Build Context + Registry
+  3. Call register_tools(RunDSL)
+     → Tools registered to Context
+  4. Create backend (Anthropic/OpenAI/etc)
+  5. Create Client (HTTP layer)
+  6. Create Logger (event recording)
+  7. Create Agent (loop orchestrator)
+  8. Add user task to Context
+  9. Run agent
+  10. Close logger
+  11. Return result
+
+User prints result.
+```
+
+---
+
+## Comparison: Python vs Ruby
+
+| Aspect | Python | Ruby |
+|--------|--------|------|
+| Function signature | Keyword-only args | Named args with keyword support |
+| Lazy singleton | `if _config is None` | `@@config ||= Config.new` |
+| Tool registration | Closure decorator over RunDSL | Block passed to run() |
+| Environment variables | `os.environ.get()` | `ENV[]` |
+| Exported API | `__all__` tuple | No explicit export list |
+
+Functionally identical.
+
+---
+
+## When to Use Each Level
+
+| Need | Use |
+|------|-----|
+| Simple one-shot task | `run()` (Step 7) ✓ |
+| Interactive multi-turn | `Repl()` (Step 8) |
+| Full control | Agent + components (Steps 0-6) |
+| Custom logging | Agent with custom Logger |
+| Multiple agents | Combine with Step 8 or higher |
+
+---
+
+## Key Design Decisions
+
+### 1. Keyword-Only Arguments
+```python
+def run(*, task, configure=None, ...):
+```
+
+**Why?** Prevents positional argument confusion. `run("task_text")` is clear vs. `run(None, "task_text")`.
+
+### 2. Lazy Config Singleton
+```python
+_config = None
+def config():
+    global _config
+    if _config is None:
+        _config = Config()
+    return _config
+```
+
+**Why?** Config is loaded once. Subsequent calls return cached instance.
+
+### 3. RunDSL as Facade
+```python
+class RunDSL:
+    def tool(self, ...):
+        return self._registry.tool(...)
+```
+
+**Why?** Users don't import Registry. RunDSL hides complexity.
+
+### 4. Try/Finally for Logger Cleanup
+```python
+try:
+    agent = Agent(...)
+    return agent.run()
+finally:
+    logger.close()
+```
+
+**Why?** Ensures logs are flushed to disk even if agent crashes.
+
+### 5. Environment Variable Auto-Loading
+```python
+environment_variable = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    ...
+}.get(backend)
+if environment_variable is not None:
+    api_key = os.environ.get(environment_variable)
+```
+
+**Why?** Users don't need to explicitly pass API keys. Standard practice (12-factor app pattern).
+
+---
+
+## What's NOT in run()
+
+- **No token counting** — Step 12 adds this
+- **No REPL loop** — Step 8 adds this
+- **No MCP servers** — Step 10 adds this
+- **No terminal UI** — Step 11 adds this
+
+run() is single-shot: one task, one run, return result.
+
+---
+
+## Common Usage Patterns
+
+**Pattern 1: Simple read file task**
+```python
+result = run(task="Read config.json and tell me the API endpoint")
+```
+
+**Pattern 2: With tools**
+```python
+def my_tools(dsl):
+    @dsl.tool("write_file", description="...", parameters={...})
+    def write_file(path, content):
+        Path(path).write_text(content)
+
+result = run(
+    task="Create a file called hello.txt with 'Hello World'",
+    configure=my_tools
+)
+```
+
+**Pattern 3: Override everything**
+```python
+result = run(
+    task="Summarize the report",
+    configure=tools,
+    model="gpt-5.4",
+    backend="openai",
+    system="You are a financial analyst. Be concise."
+)
+```
+
+---
+
+## Data Flow Summary (Through Step 7)
+
+```
+Step 0: Config loads YAML
+   ↓
+Step 1: Context holds messages and tools
+   ↓
+Step 2: Registry dispatches tools by name
+   ↓
+Step 3: PromptBuilder + Backend format for the wire
+   ├─ Different backends for different providers
+   └─ Payload ready for HTTP
+   ↓
+Step 4: Client sends HTTP request with retries
+   ├─ Handles transient failures (network, rate limits)
+   ├─ Exponential backoff
+   └─ Returns parsed JSON response
+   ↓
+Step 5: Agent loop orchestrates everything
+   ├─ Iteration counter + limits
+   ├─ Tool call handling via Registry
+   ├─ Tool result storage in Context
+   ├─ Response parsing (normalized format)
+   └─ Loop until done or limit reached
+   ↓
+Step 6: Logger records everything
+   ├─ Structured JSONL events
+   ├─ Token tracking (normalized across providers)
+   ├─ Cost estimation
+   ├─ Real-time streaming (auto-flushed)
+   └─ Debug mode for full API responses
+   ↓
+Step 7: Simple run() one-shot API ⭐
+   ├─ Single function call
+   ├─ Hides all machinery from Steps 0-6
+   ├─ Auto-loads config, credentials, models
+   ├─ Tool registration via RunDSL decorator
+   └─ Returns final result text
+   ↓ (in future steps)
+Step 8: Interactive REPL loop (multi-turn)
+Step 10: MCP tool integration (external tools)
+Step 11: Terminal UI (Textual TUI)
+Step 12: Context management & token limits (context windows)
+```
+
+---
+
+# Step 8: The REPL Loop - Python Implementation Deep Dive
+
+## Overview
+
+Step 8 introduces the **Repl** class and **`repl()` function**, which solve the **interactivity problem**: "How do we let users have multi-turn conversations where each turn remembers all prior turns?"
+
+Unlike `run()` (Step 7) which is one-shot, the REPL (Read-Eval-Print Loop) keeps a persistent Context across multiple turns:
+
+1. User types a query
+2. Agent runs with full conversation history
+3. Result printed
+4. User types another query
+5. Agent sees previous messages + new query
+6. Loop continues
+
+**Key insight:** Same Context is reused. Each turn adds to the message history.
+
+---
+
+## The Repl Class
+
+**File:** `boukensha/repl.py` (113 lines)
+
+```python
+class Repl:
+    """Interactive, multi-turn agent session over a shared context."""
+
+    PROMPT = "boukensha> "
+    HELP = """Commands:
+  /quiet   suppress logging output
+  /loud    re-enable logging output
+  /clear   wipe conversation history (tools stay)
+  /exit    leave the REPL
+  /quit    leave the REPL
+  /help    show this message"""
+
+    def __init__(
+        self, *, context, registry, builder, client, logger,
+        task_settings=None, max_iterations=None, max_output_tokens=None,
+        config_dir=None, provider=None, model=None, version=None, api_key=None,
+    ):
+        self.context = context
+        self.registry = registry
+        self.builder = builder
+        self.client = client
+        self.logger = logger
+        self.task_settings = task_settings
+        self.max_iterations = max_iterations
+        self.max_output_tokens = max_output_tokens
+        self.config_dir = config_dir
+        self.provider = provider
+        self.model = model
+        self.version = version
+        self.api_key = api_key
+        self.turn = 0
+```
+
+### Constructor Parameters
+
+- `context` — Shared Context that persists across turns
+- `registry` — Registry for tool dispatch
+- `builder` — PromptBuilder for formatting requests
+- `client` — Client for HTTP calls
+- `logger` — Logger for recording events
+- `task_settings` — Config for this task
+- `max_iterations` — Iteration limit per turn
+- `max_output_tokens` — Token limit per response
+- `config_dir` — Path to config directory (for display)
+- `provider` — Backend name (for display)
+- `model` — Model name (for display)
+- `version` — Version string (for display)
+- `api_key` — API key (for display status)
+
+**Key:** The Context is passed in and shared across all turns.
+
+---
+
+## The Main Loop: `start()`
+
+```python
+def start(self):
+    print(self._banner())
+    while True:
+        sys.stdout.write(self.PROMPT)
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        task = line.strip()
+        if not task:
+            continue
+        if task in ("/exit", "/quit"):
+            print("Goodbye.")
+            break
+        if task == "/help":
+            print(self.HELP)
+            continue
+        if task == "/quiet":
+            from . import quiet
+            quiet()
+            print("(logging suppressed — type /loud to re-enable)")
+            continue
+        if task == "/loud":
+            from . import loud
+            loud()
+            print("(logging enabled)")
+            continue
+        if task == "/clear":
+            self.context.clear_messages()
+            self.turn = 0
+            print("(conversation history cleared)")
+            continue
+        self._run_turn(task)
+```
+
+### Loop Flow
+
+**1. Print banner** — Show version, config, provider, model
+
+**2. Read-Eval-Print loop:**
+
+```
+Print prompt: "boukensha> "
+↓
+Read line from stdin
+↓
+EOF? → break (exit)
+Empty? → continue (skip)
+Command? → handle special command
+Else → run agent turn
+```
+
+### Commands
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show help message |
+| `/quiet` | Suppress logging output |
+| `/loud` | Re-enable logging output |
+| `/clear` | Wipe conversation history (tools stay) |
+| `/exit` or `/quit` | Leave the REPL |
+
+---
+
+## Running a Turn: `_run_turn()`
+
+```python
+def _run_turn(self, task):
+    self.turn += 1
+    self.logger.turn(self.turn)
+    self.context.add_message("user", task)
+    agent = Agent(
+        context=self.context, registry=self.registry, builder=self.builder,
+        client=self.client, logger=self.logger,
+        task_settings=self.task_settings, max_iterations=self.max_iterations,
+        max_output_tokens=self.max_output_tokens,
+    )
+    try:
+        result = agent.run()
+        print()
+        print(result)
+    except LoopError as error:
+        print(f"\n[error] {error}")
+    except ApiError as error:
+        print(f"\n[error] API call failed: {error}")
+```
+
+### What Happens
+
+**1. Increment turn counter:**
+```python
+self.turn += 1
+```
+
+**2. Log turn start:**
+```python
+self.logger.turn(self.turn)  # {"phase": "turn", "n": 1}
+```
+
+**3. Add user message to context:**
+```python
+self.context.add_message("user", task)
+```
+
+**Now Context has:** All previous messages + this new user message.
+
+**4. Create fresh Agent** (new instance each turn):
+```python
+agent = Agent(
+    context=self.context,  # Same Context!
+    ...
+)
+```
+
+**5. Run agent:**
+```python
+result = agent.run()
+```
+
+The agent sees the full conversation history, makes tool calls, adds tool results to Context.
+
+**6. Print result:**
+```python
+print(result)
+```
+
+**7. Error handling:**
+```python
+except LoopError as error:
+    print(f"\n[error] {error}")
+except ApiError as error:
+    print(f"\n[error] API call failed: {error}")
+```
+
+Errors don't crash the REPL; they're caught and printed.
+
+---
+
+## The Banner: `_banner()`
+
+```python
+def _banner(self):
+    key_status = "✓ API key set" if self.api_key and self.api_key.strip() else "✗ API key not set"
+    provider = self.provider or "default"
+    model = self.model or "default"
+    config_dir = self.config_dir or "(default)"
+    if not self.config_dir or not os.path.isdir(self.config_dir):
+        config_dir = f"{config_dir}  ✗ directory not found"
+    version = self.version or "?.?.?"
+    return (
+        f"\n╭── BOUKENSHA MUD Assistant (v{version}) ──╮\n"
+        f"  config:    {config_dir}\n"
+        f"  provider:  {provider} ({model})  {key_status}\n\n"
+        "  /quiet or /loud   toggle logging\n"
+        "  /clear            reset conversation history\n"
+        "  /exit or /quit    leave the REPL\n"
+    )
+```
+
+**Example output:**
+```
+╭── BOUKENSHA MUD Assistant (v0.8.0) ──╮
+  config:    /home/user/.boukensha
+  provider:  anthropic (claude-haiku-4-5)  ✓ API key set
+
+  /quiet or /loud   toggle logging
+  /clear            reset conversation history
+  /exit or /quit    leave the REPL
+```
+
+---
+
+## Context Enhancements for REPL
+
+Step 8 adds a new method to Context:
+
+**File:** `boukensha/context.py` (line 18-20)
+
+```python
+def clear_messages(self):
+    """Clear conversation history while preserving tools and list identity."""
+    self.messages.clear()
+```
+
+**Why?** When user types `/clear`, we wipe messages but keep tools registered.
+
+---
+
+## Logger Enhancements for REPL
+
+Step 8 adds a new method to Logger:
+
+**File:** `boukensha/logger.py` (line 29-30)
+
+```python
+def turn(self, n):
+    self._write({"phase": "turn", "n": n})
+```
+
+**Example event:**
+```json
+{"phase": "turn", "n": 1, "session_id": "...", "at": "2026-07-26T14:30:22+00:00"}
+{"phase": "turn", "n": 2, "session_id": "...", "at": "2026-07-26T14:30:35+00:00"}
+```
+
+---
+
+## The repl() Function
+
+**File:** `boukensha/__init__.py` (lines 140-221)
+
+```python
+def repl(
+    *, configure=None, system=None, model=None, backend=None, api_key=None,
+    ollama_host="http://localhost:11434", log=None, max_output_tokens=None,
+):
+    """Start an interactive player session with persistent conversation history."""
+    cfg = config()
+    task_settings = cfg.tasks(Player.task_name())
+
+    # (Same setup as run()...)
+    # 1. Load config
+    # 2. Create context
+    # 3. Register tools via RunDSL
+    # 4. Create backend
+    # 5. Create logger
+
+    logger = None
+    try:
+        logger = Logger(...)
+        return Repl(
+            context=context, registry=registry, builder=builder, client=client,
+            logger=logger, task_settings=task_settings,
+            max_iterations=effective_max_iterations,
+            max_output_tokens=effective_max_output_tokens,
+            config_dir=cfg.dir, provider=backend, model=model,
+            version=__version__, api_key=api_key,
+        ).start()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        if logger is not None:
+            logger.close()
+```
+
+### Parameters
+
+Same as `run()`, but no `task` parameter (tasks come from user input):
+- `configure` — Tool registration callback
+- `system` — System prompt
+- `model`, `backend`, `api_key` — Overrides
+- `log` — Custom log file
+
+### Flow
+
+1. Load config (same as `run()`)
+2. Create Context + Registry
+3. Register tools
+4. Create Backend, PromptBuilder, Client, Logger
+5. Create Repl instance
+6. Call `.start()` to enter loop
+7. Handle Ctrl+C gracefully
+8. Close logger when done
+
+---
+
+## Complete Example Session
+
+```python
+from boukensha import repl
+
+def register_tools(dsl):
+    @dsl.tool("read_file", description="...", parameters={...})
+    def read_file(path):
+        return Path(path).read_text()
+
+    @dsl.tool("list_directory", description="...", parameters={...})
+    def list_directory(path):
+        return ", ".join(sorted(f.name for f in Path(path).iterdir()))
+
+repl(configure=register_tools)
+```
+
+**User interaction:**
+```
+╭── BOUKENSHA MUD Assistant (v0.8.0) ──╮
+  config:    /home/user/.boukensha
+  provider:  anthropic (claude-haiku-4-5)  ✓ API key set
+
+  /quiet or /loud   toggle logging
+  /clear            reset conversation history
+  /exit or /quit    leave the REPL
+
+boukensha> Read the README.md file
+[iteration 1/25]
+  tool call → read_file({"path": "README.md"})
+  tool result → # Boukensha...
+
+Here's what I found in README.md:
+Boukensha is a framework for building AI agents...
+
+boukensha> Now summarize it in one sentence
+(Agent runs again, sees README content from previous turn)
+Boukensha is an AI agent framework for MUD games built in Python.
+
+boukensha> /clear
+(conversation history cleared)
+
+boukensha> What files are in this directory?
+[iteration 1/25]
+  tool call → list_directory({"path": "."})
+  tool result → README.md, setup.py, ...
+
+The directory contains: README.md, setup.py, LICENSE, and 2 subdirectories.
+
+boukensha> /exit
+Goodbye.
+```
+
+---
+
+## Key Differences: run() vs repl()
+
+| Aspect | run() | repl() |
+|--------|-------|--------|
+| Entry | `result = run(task="...")` | `repl()` then user input |
+| Context | New Context per call | Shared Context |
+| Turns | One turn (Agent.run() once) | Multiple turns (Agent.run() per input) |
+| History | No persistence | Full history across turns |
+| Return | Final answer string | None (prints directly) |
+| Cleanup | Automatic (try/finally) | Interactive loop |
+
+---
+
+## Turn Management
+
+```python
+self.turn += 1          # Increment counter
+self.logger.turn(self.turn)  # Log turn start
+self.context.add_message("user", task)  # Add new message
+agent = Agent(...)      # Create agent
+result = agent.run()    # Run with full history
+```
+
+**Context evolution:**
+```
+Turn 1:
+  Context.messages = [Message("user", "Read README")]
+  Agent runs, makes tool calls, adds results
+  Context.messages = [Message("user", ...), Message("assistant", ...), Message("tool_result", ...)]
+
+Turn 2:
+  Context.add_message("user", "Summarize it")
+  Context.messages = [..., Message("tool_result", ...), Message("user", "Summarize it")]
+  Agent runs, sees full history
+  Context.messages = [..., Message("tool_result", ...), Message("user", ...), Message("assistant", ...), ...]
+```
+
+---
+
+## Error Handling
+
+```python
+try:
+    result = agent.run()
+    print()
+    print(result)
+except LoopError as error:
+    print(f"\n[error] {error}")
+except ApiError as error:
+    print(f"\n[error] API call failed: {error}")
+```
+
+Errors in a turn are caught and printed. The REPL continues running (doesn't crash).
+
+**Also at top level:**
+```python
+except KeyboardInterrupt:
+    print("\nInterrupted.")
+finally:
+    if logger is not None:
+        logger.close()
+```
+
+Ctrl+C exits gracefully. Logger always closed.
+
+---
+
+## Version String
+
+```python
+__version__ = "0.8.0"
+```
+
+Displayed in banner. Shown to user so they know framework version.
+
+---
+
+## Running the Example
+
+```bash
+cd week1_baseline/python/08_the_repl_loop
+python examples/example.py
+```
+
+**You'll see:**
+```
+=== BOUKENSHA Step 8: The REPL loop ===
+
+Config: #<Boukensha::Config dir=...>
+
+╭── BOUKENSHA MUD Assistant (v0.8.0) ──╮
+  config:    ...
+  provider:  anthropic (claude-haiku-4-5)  ✓ API key set
+  ...
+
+boukensha> (type your query)
+```
+
+Then you can interact:
+```
+boukensha> List the files in this directory
+... (agent runs) ...
+The files are: ...
+
+boukensha> Read the README.md file
+... (agent runs, sees previous query) ...
+Here's what the README says: ...
+
+boukensha> /clear
+(conversation history cleared)
+
+boukensha> /exit
+Goodbye.
+```
+
+---
+
+## Comparison: Python vs Ruby
+
+| Aspect | Python | Ruby |
+|--------|--------|------|
+| Loop | `while True: ... readline()` | `loop do ... gets.chomp end` |
+| Turn counter | `self.turn` (instance var) | `@turn` (instance var) |
+| Context reuse | Passed to each Agent | Passed to each Agent |
+| Commands | if/elif chain | case statement |
+| Banner | String interpolation | String interpolation |
+
+Functionally identical.
+
+---
+
+## What's NOT in the REPL
+
+- **No command history** — No up/down arrow recall (would need readline library)
+- **No auto-complete** — No tab-completion of tools
+- **No persistent state** — Exits on Ctrl+C, conversation lost unless logged
+- **No multi-user** — Single-user interactive session only
+- **No GUI** — Plain text REPL (Step 11 adds Textual UI)
+
+---
+
+## Use Cases for REPL vs run()
+
+**Use run() when:**
+- One-shot task
+- Batch processing
+- Embedded in larger application
+- Non-interactive
+
+**Use repl() when:**
+- Exploring capability
+- Iterative problem-solving
+- User wants to refine queries
+- Interactive debugging
+- Playing MUD games!
+
+---
+
+## Data Flow Summary (Through Step 8)
+
+```
+Step 0: Config loads YAML
+   ↓
+Step 1: Context holds messages and tools
+   ↓
+Step 2: Registry dispatches tools by name
+   ↓
+Step 3: PromptBuilder + Backend format for the wire
+   ├─ Different backends for different providers
+   └─ Payload ready for HTTP
+   ↓
+Step 4: Client sends HTTP request with retries
+   ├─ Handles transient failures (network, rate limits)
+   ├─ Exponential backoff
+   └─ Returns parsed JSON response
+   ↓
+Step 5: Agent loop orchestrates everything
+   ├─ Iteration counter + limits
+   ├─ Tool call handling via Registry
+   ├─ Tool result storage in Context
+   ├─ Response parsing (normalized format)
+   └─ Loop until done or limit reached
+   ↓
+Step 6: Logger records everything
+   ├─ Structured JSONL events
+   ├─ Token tracking (normalized across providers)
+   ├─ Cost estimation
+   ├─ Real-time streaming (auto-flushed)
+   └─ Debug mode for full API responses
+   ↓
+Step 7: Simple run() one-shot API
+   ├─ Single function call
+   ├─ Hides all machinery from Steps 0-6
+   ├─ Auto-loads config, credentials, models
+   ├─ Tool registration via RunDSL decorator
+   └─ Returns final result text
+   ↓
+Step 8: Interactive REPL loop ⭐
+   ├─ Multi-turn conversation
+   ├─ Shared Context across turns
+   ├─ Message history grows each turn
+   ├─ Commands: /clear, /quiet, /loud, /help, /exit
+   ├─ Graceful error handling (errors don't crash loop)
+   └─ Version and config display in banner
+   ↓ (in future steps)
+Step 10: MCP tool integration (external tools)
+Step 11: Terminal UI (Textual TUI)
+Step 12: Context management & token limits (context windows)
+```
+
+---
